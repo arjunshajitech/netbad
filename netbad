@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+#
+# netbad - break your network on purpose
+#
+# A human-readable wrapper around `tc` + `netem` for testing how software
+# behaves on a bad network. Linux only.
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+PROG="${0##*/}"
+SELF="$(readlink -f "$0")"
+ARGV=("$@")
+
+DRY_RUN=0
+FRESH=0
+
+# ---------------------------------------------------------------- output ----
+
+if [[ -t 1 ]]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'
+  RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'
+  RESET=$'\e[0m'
+else
+  BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; CYAN=''; RESET=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "${YELLOW}heads up:${RESET} $*" >&2; }
+die()  { printf '%s\n' "${RED}error:${RESET} $*" >&2; exit 1; }
+
+# ------------------------------------------------------------ environment ----
+
+require_tools() {
+  [[ $(uname -s) == Linux ]] || die "netbad only works on Linux (tc/netem is a kernel feature)"
+  command -v tc >/dev/null || die "\`tc\` is missing. Install it with: sudo apt install iproute2"
+  command -v ip >/dev/null || die "\`ip\` is missing. Install it with: sudo apt install iproute2"
+}
+
+# Re-run ourselves under sudo so the user never has to remember to type it.
+ensure_root() {
+  (( DRY_RUN )) && return 0
+  [[ ${EUID:-$(id -u)} -eq 0 ]] && return 0
+  command -v sudo >/dev/null || die "changing the network needs root, and sudo isn't available"
+  say "${DIM}(asking for sudo)${RESET}"
+  exec sudo -- "$SELF" ${ARGV[@]+"${ARGV[@]}"}
+}
+
+default_iface() {
+  local d=''
+  d=$(ip -o route get 1.1.1.1 2>/dev/null |
+        awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}') || true
+  [[ -n $d ]] || d=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}') || true
+  printf '%s' "$d"
+}
+
+iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
+
+all_ifaces() {
+  ip -o link show | awk -F': ' '{sub(/@.*/,"",$2); print $2}'
+}
+
+iface_is_up() {
+  [[ $(cat "/sys/class/net/$1/operstate" 2>/dev/null) == up ]]
+}
+
+resolve_iface() {
+  local want=${1:-}
+  if [[ -z $want ]]; then
+    want=$(default_iface)
+    [[ -n $want ]] || die "couldn't work out which interface to use — name one, e.g. \`$PROG status on eth0\`"
+  fi
+  iface_exists "$want" || die "there's no interface called \"$want\" (try \`$PROG list\`)"
+  printf '%s' "$want"
+}
+
+# ------------------------------------------------------------- unit input ----
+
+is_number() { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+
+# 10 | 10% | 0.5  ->  10%
+as_percent() {
+  local v=${1%\%}
+  is_number "$v" || die "\"$1\" doesn't look like a percentage (try 10 or 10%)"
+  awk -v v="$v" 'BEGIN { exit !(v >= 0 && v <= 100) }' ||
+    die "a percentage has to be between 0 and 100, got \"$1\""
+  printf '%s%%' "$v"
+}
+
+# 100 | 100ms | 0.2s | 200us  ->  netem time
+as_time() {
+  local v=$1
+  if is_number "$v"; then printf '%sms' "$v"; return; fi
+  [[ $v =~ ^([0-9]+(\.[0-9]+)?)(ms|msec|s|sec|secs|seconds|us|usec)$ ]] ||
+    die "\"$v\" doesn't look like a time (try 100ms, 0.5s or just 100)"
+  local n=${BASH_REMATCH[1]} u=${BASH_REMATCH[3]}
+  case $u in
+    ms|msec)             u=ms ;;
+    s|sec|secs|seconds)  u=s  ;;
+    us|usec)             u=us ;;
+  esac
+  printf '%s%s' "$n" "$u"
+}
+
+# 1mbit | 1mbps | 1m | 500kbit  ->  1mbit
+as_rate() {
+  local v=${1,,}
+  [[ $v =~ ^([0-9]+(\.[0-9]+)?)(k|m|g)?(bit|bps|b)?$ ]] ||
+    die "\"$1\" doesn't look like a speed (try 1mbit, 500kbit or 1m)"
+  local n=${BASH_REMATCH[1]} p=${BASH_REMATCH[3]:-}
+  [[ -n $p ]] || die "\"$1\" needs a unit (try ${n}kbit, ${n}mbit or ${n}gbit)"
+  printf '%s%sbit' "$n" "$p"
+}
+
+# 30 | 30s | 5m | 1h | 500ms  ->  seconds
+as_seconds() {
+  local v=${1,,}
+  if is_number "$v"; then printf '%s' "$v"; return; fi
+  [[ $v =~ ^([0-9]+(\.[0-9]+)?)(ms|s|sec|secs|m|min|mins|h|hr|hrs)$ ]] ||
+    die "\"$1\" doesn't look like a duration (try 30s, 5m or 1h)"
+  local n=${BASH_REMATCH[1]} u=${BASH_REMATCH[3]}
+  case $u in
+    ms)            awk -v n="$n" 'BEGIN { printf "%g", n/1000 }' ;;
+    s|sec|secs)    printf '%s' "$n" ;;
+    m|min|mins)    awk -v n="$n" 'BEGIN { printf "%g", n*60 }' ;;
+    h|hr|hrs)      awk -v n="$n" 'BEGIN { printf "%g", n*3600 }' ;;
+  esac
+}
+
+# ------------------------------------------------------- reading the state ---
+
+declare -A CUR=()
+declare -A WANT=()
+
+_grab_percent_pair() { # line key -> CUR[key], CUR[key_corr]
+  local line=$1 key=$2
+  if [[ $line =~ (^|[[:space:]])$key[[:space:]]+([0-9.]+%)([[:space:]]+([0-9.]+%))? ]]; then
+    CUR[$key]=${BASH_REMATCH[2]}
+    [[ -n ${BASH_REMATCH[4]:-} ]] && CUR[${key}_corr]=${BASH_REMATCH[4]}
+  fi
+  return 0
+}
+
+# Fills CUR from whatever netem is currently doing. Returns 1 if the
+# interface is clean.
+load_current() {
+  local iface=$1 line=''
+  CUR=()
+  line=$(tc qdisc show dev "$iface" 2>/dev/null | grep -m1 -E '^qdisc netem' || true)
+  [[ -n $line ]] || return 1
+
+  if [[ $line =~ delay[[:space:]]+([0-9.]+[a-z]+)([[:space:]]+([0-9.]+[a-z]+))? ]]; then
+    CUR[delay]=${BASH_REMATCH[1]}
+    [[ -n ${BASH_REMATCH[3]:-} ]] && CUR[jitter]=${BASH_REMATCH[3]}
+  fi
+  if [[ $line =~ rate[[:space:]]+([0-9.]+[A-Za-z]+) ]]; then
+    CUR[rate]=${BASH_REMATCH[1]}
+  fi
+  _grab_percent_pair "$line" loss
+  _grab_percent_pair "$line" duplicate
+  _grab_percent_pair "$line" corrupt
+  _grab_percent_pair "$line" reorder
+  return 0
+}
+
+# Start from what's already applied, unless --only was asked for.
+init_want() {
+  local iface=$1 k
+  WANT=()
+  (( FRESH )) && return 0
+  if load_current "$iface"; then
+    for k in "${!CUR[@]}"; do WANT[$k]=${CUR[$k]}; done
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------- applying it ---
+
+declare -a NETEM_ARGS=()
+
+build_netem_args() {
+  NETEM_ARGS=()
+
+  # netem can only reorder packets that are sitting in a delay queue.
+  if [[ -n ${WANT[reorder]:-} && -z ${WANT[delay]:-} ]]; then
+    WANT[delay]=10ms
+    warn "reordering needs some delay to work, so I added 10ms of it"
+  fi
+
+  if [[ -n ${WANT[delay]:-} ]]; then
+    NETEM_ARGS+=(delay "${WANT[delay]}")
+    [[ -n ${WANT[jitter]:-} ]] && NETEM_ARGS+=("${WANT[jitter]}")
+  fi
+  local k
+  for k in loss duplicate corrupt reorder; do
+    if [[ -n ${WANT[$k]:-} ]]; then
+      NETEM_ARGS+=("$k" "${WANT[$k]}")
+      [[ -n ${WANT[${k}_corr]:-} ]] && NETEM_ARGS+=("${WANT[${k}_corr]}")
+    fi
+  done
+  [[ -n ${WANT[rate]:-} ]] && NETEM_ARGS+=(rate "${WANT[rate]}")
+  return 0
+}
+
+run_tc() {
+  say "${DIM}\$ tc $*${RESET}"
+  (( DRY_RUN )) && return 0
+  tc "$@"
+}
+
+commit() { # iface [auto-heal seconds]
+  local iface=$1 secs=${2:-}
+  build_netem_args
+
+  if (( ${#NETEM_ARGS[@]} == 0 )); then
+    do_clear "$iface"
+    return 0
+  fi
+
+  ensure_root
+  run_tc qdisc replace dev "$iface" root netem "${NETEM_ARGS[@]}"
+  (( DRY_RUN )) && return 0
+
+  say ""
+  print_status "$iface"
+  if [[ -n $secs ]]; then
+    schedule_heal "$iface" "$secs"
+  else
+    say "${DIM}   put it back with: $PROG clear on $iface${RESET}"
+  fi
+}
+
+schedule_heal() {
+  local iface=$1 secs=$2
+  nohup setsid bash -c 'sleep "$1"; tc qdisc del dev "$2" root' _ "$secs" "$iface" \
+    >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  say "${DIM}   healing by itself in ${secs}s${RESET}"
+}
+
+do_clear() {
+  local iface=$1
+  if ! load_current "$iface"; then
+    say "${GREEN}●${RESET} ${BOLD}$iface${RESET} was already fine — nothing to undo"
+    return 0
+  fi
+  ensure_root
+  run_tc qdisc del dev "$iface" root
+  (( DRY_RUN )) || say "${GREEN}●${RESET} ${BOLD}$iface${RESET} is back to normal"
+}
+
+# ------------------------------------------------------------- describing ----
+
+print_status() {
+  local iface=$1
+  if ! load_current "$iface"; then
+    say "${GREEN}●${RESET} ${BOLD}$iface${RESET} is clean — traffic is untouched"
+    return 0
+  fi
+  say "${YELLOW}●${RESET} ${BOLD}$iface${RESET} is messing with outgoing traffic:"
+  local d
+  if [[ -n ${CUR[delay]:-} ]]; then
+    d="${CUR[delay]}"
+    [[ -n ${CUR[jitter]:-} ]] && d="$d, give or take ${CUR[jitter]}"
+    printf '     %-11s %s\n' "delayed" "by $d"
+  fi
+  [[ -n ${CUR[loss]:-} ]]      && printf '     %-11s %s\n' "dropped"    "${CUR[loss]} of packets"
+  [[ -n ${CUR[reorder]:-} ]]   && printf '     %-11s %s\n' "reordered"  "${CUR[reorder]} of packets"
+  [[ -n ${CUR[duplicate]:-} ]] && printf '     %-11s %s\n' "duplicated" "${CUR[duplicate]} of packets"
+  [[ -n ${CUR[corrupt]:-} ]]   && printf '     %-11s %s\n' "corrupted"  "${CUR[corrupt]} of packets"
+  [[ -n ${CUR[rate]:-} ]]      && printf '     %-11s %s\n' "capped"     "at ${CUR[rate]}"
+  return 0
+}
+
+one_line_state() {
+  local iface=$1 bits=()
+  if ! load_current "$iface"; then
+    printf '%s' "${DIM}clean${RESET}"
+    return 0
+  fi
+  [[ -n ${CUR[delay]:-} ]]     && bits+=("${CUR[delay]} delay")
+  [[ -n ${CUR[loss]:-} ]]      && bits+=("${CUR[loss]} loss")
+  [[ -n ${CUR[reorder]:-} ]]   && bits+=("${CUR[reorder]} reorder")
+  [[ -n ${CUR[duplicate]:-} ]] && bits+=("${CUR[duplicate]} duplicate")
+  [[ -n ${CUR[corrupt]:-} ]]   && bits+=("${CUR[corrupt]} corrupt")
+  [[ -n ${CUR[rate]:-} ]]      && bits+=("${CUR[rate]} cap")
+  local out='' bit
+  for bit in "${bits[@]}"; do out+="${out:+, }$bit"; done
+  printf '%s' "${YELLOW}${out}${RESET}"
+}
+
+do_list() {
+  local show_all=${1:-} iface state def
+  def=$(default_iface)
+  say "${BOLD}interfaces${RESET}"
+  for iface in $(all_ifaces); do
+    [[ $iface == lo ]] && continue
+    if [[ -z $show_all ]] && ! iface_is_up "$iface" && ! load_current "$iface"; then
+      continue
+    fi
+    state=$(one_line_state "$iface")
+    if [[ $iface == "$def" ]]; then
+      printf '  %-20s %s %s\n' "$iface" "$state" "${CYAN}(default)${RESET}"
+    else
+      printf '  %-20s %s\n' "$iface" "$state"
+    fi
+  done
+  [[ -z $show_all ]] && say "${DIM}  (only interfaces that are up — use \`$PROG list all\` for the rest)${RESET}"
+  return 0
+}
+
+# ----------------------------------------------------------------- parsing ---
+
+VAL='' VAL2='' IFACE='' DURATION='' JITTER=''
+
+scan() {
+  VAL='' VAL2='' IFACE='' DURATION='' JITTER=''
+  while (( $# )); do
+    case $1 in
+      for)
+        shift; (( $# )) || die "\"for\" needs a duration, e.g. \`for 30s\`"
+        DURATION=$(as_seconds "$1") ;;
+      jitter|wobble|'+-')
+        shift; (( $# )) || die "\"jitter\" needs a time, e.g. \`jitter 20ms\`"
+        JITTER=$(as_time "$1") ;;
+      *)
+        if [[ -z $VAL && $1 =~ ^[0-9] ]];        then VAL=$1
+        elif [[ -z $VAL2 && $1 =~ ^[0-9] ]];     then VAL2=$1
+        elif [[ -z $IFACE ]];                    then IFACE=$1
+        else die "I don't know what to do with \"$1\""
+        fi ;;
+    esac
+    shift
+  done
+  return 0
+}
+
+need_value() {
+  [[ -n $VAL ]] || die "$1"
+}
+
+# -------------------------------------------------------------------- help ---
+
+usage() {
+  cat <<EOF
+${BOLD}netbad${RESET} — break your network on purpose ${DIM}(a friendly face for tc/netem)${RESET}
+
+${BOLD}make it bad${RESET}
+  $PROG drop 10%                  throw away 10% of outgoing packets
+  $PROG delay 100ms               hold every packet back by 100ms
+  $PROG delay 100ms jitter 20ms   ...and make the delay wobble
+  $PROG shuffle 10%               deliver 10% of packets out of order
+  $PROG duplicate 5%              send 5% of packets twice
+  $PROG corrupt 1%                flip a random bit in 1% of packets
+  $PROG limit 1mbit               squeeze the bandwidth
+
+${BOLD}look around${RESET}
+  $PROG status                    what's happening right now
+  $PROG stats                     packet counters straight from tc
+  $PROG list                      every interface and its state
+
+${BOLD}make it good again${RESET}
+  $PROG clear                     undo everything on one interface
+  $PROG clear all                 undo everything, everywhere
+
+${BOLD}extras you can add to any command${RESET}
+  on <interface>    which interface ${DIM}(default: the one with your internet)${RESET}
+  for <duration>    undo it automatically later, e.g. ${DIM}for 30s${RESET}
+  --only            replace what's there instead of adding to it
+  --dry-run         show the tc command, change nothing
+
+${BOLD}good to know${RESET}
+  Impairments stack. ${DIM}$PROG drop 10%${RESET} then ${DIM}$PROG delay 100ms${RESET} gives you both.
+  Only ${BOLD}outgoing${RESET} traffic is affected — that's how netem works.
+  Anything that changes the network asks for sudo by itself.
+EOF
+}
+
+# ----------------------------------------------------------------- command ---
+
+impair() { # key value-as X extra...
+  local key=$1 iface
+  iface=$(resolve_iface "$IFACE")
+  init_want "$iface"
+  case $key in
+    delay)
+      WANT[delay]=$(as_time "$VAL")
+      [[ -n $JITTER ]] && WANT[jitter]=$JITTER
+      [[ -n $VAL2 ]] && WANT[jitter]=$(as_time "$VAL2")
+      ;;
+    rate)
+      WANT[rate]=$(as_rate "$VAL")
+      ;;
+    *)
+      WANT[$key]=$(as_percent "$VAL")
+      [[ -n $VAL2 ]] && WANT[${key}_corr]=$(as_percent "$VAL2")
+      ;;
+  esac
+  commit "$iface" "$DURATION"
+}
+
+main() {
+  local args=() a
+  for a in ${ARGV[@]+"${ARGV[@]}"}; do
+    case $a in
+      --dry-run|-n)            DRY_RUN=1 ;;
+      --only|--fresh|--replace) FRESH=1 ;;
+      -h|--help)               usage; exit 0 ;;
+      -V|--version)            say "$PROG $VERSION"; exit 0 ;;
+      # filler words, so commands can read like a sentence
+      on|to|at|of|the|dev|interface|packets|traffic|please) ;;
+      -*)                      die "unknown option \"$a\" (try \`$PROG help\`)" ;;
+      *)                       args+=("$a") ;;
+    esac
+  done
+
+  require_tools
+
+  local cmd=${args[0]:-help}
+  local rest=("${args[@]:1}")
+
+  case ${cmd,,} in
+    help|-h)
+      usage ;;
+
+    drop|loss|lose)
+      scan ${rest[@]+"${rest[@]}"}
+      need_value "how much should I drop? e.g. \`$PROG drop 10%\`"
+      impair loss ;;
+
+    delay|slow|lag)
+      scan ${rest[@]+"${rest[@]}"}
+      need_value "how much delay? e.g. \`$PROG delay 100ms\`"
+      impair delay ;;
+
+    shuffle|reorder|jumble)
+      scan ${rest[@]+"${rest[@]}"}
+      need_value "how much should I reorder? e.g. \`$PROG shuffle 10%\`"
+      impair reorder ;;
+
+    duplicate|dupe|echo|repeat)
+      scan ${rest[@]+"${rest[@]}"}
+      need_value "how much should I duplicate? e.g. \`$PROG duplicate 5%\`"
+      impair duplicate ;;
+
+    corrupt|garble|mangle)
+      scan ${rest[@]+"${rest[@]}"}
+      need_value "how much should I corrupt? e.g. \`$PROG corrupt 1%\`"
+      impair corrupt ;;
+
+    limit|cap|throttle)
+      scan ${rest[@]+"${rest[@]}"}
+      need_value "what speed should I cap it at? e.g. \`$PROG limit 1mbit\`"
+      impair rate ;;
+
+    status|show|what)
+      scan ${rest[@]+"${rest[@]}"}
+      print_status "$(resolve_iface "$IFACE")" ;;
+
+    stats|counters)
+      scan ${rest[@]+"${rest[@]}"}
+      local iface; iface=$(resolve_iface "$IFACE")
+      tc -s qdisc show dev "$iface" ;;
+
+    list|interfaces|ifaces)
+      do_list "${rest[0]:-}" ;;
+
+    clear|heal|fix|reset|stop|normal|undo)
+      if [[ ${rest[0]:-} == all || ${rest[0]:-} == everything ]]; then
+        local iface
+        for iface in $(all_ifaces); do
+          load_current "$iface" && do_clear "$iface"
+        done
+        say "${GREEN}●${RESET} everything is back to normal"
+      else
+        scan ${rest[@]+"${rest[@]}"}
+        do_clear "$(resolve_iface "$IFACE")"
+      fi ;;
+
+    *)
+      die "I don't know the command \"$cmd\" (try \`$PROG help\`)" ;;
+  esac
+}
+
+main
